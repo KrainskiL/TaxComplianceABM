@@ -1,0 +1,1453 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.3" snapToGrid="true">
+  <code><![CDATA[globals [
+  avg-degree ;; average node degree
+  homophily-strength ;; strength of homophily mechanism
+  q0 q1 q2 q3 q4 ;; min + quartiles of disposable income + max
+  step-tax-collected ;; amount of taxes collected in one tick (from income + redistribution) - for reporting
+  redistributable-tax ;; tax that can be redistributed in a tick - for redistribution mechanism
+  cumulative-tax-collected  ; Running total of tax collected over all rounds - sum of step-tax-collected
+  gini ;; Gini coefficient - measure of inequality
+  log-mean  ; Mean of the logarithm of income
+  log-sd    ; Standard deviation of the logarithm of income
+  tax-rate  ; Average tax rate
+  fraction-disadvantaged ;; Fraction of disadvantaged population to receive extra tax in capability world
+  disadvantaged-tax-share-rate ; Share of taxes to be redistributed within disadvantaged - only in capability world-preference
+  match-compliance-probability ;; Base compliance for citizens with preferences matching the world
+  mismatch-compliance-probability ;; Base compliance for citizens with preferences not matching the world
+  random-compliance-probability ;; Base compliance for citizens without knowledge
+  ;; Running means and variances
+  w-count  ; n: the number of observations seen so far
+  w-mean-comp   ; the running average (compliance)
+  w-M2-comp ; the running sum of squares of differences from the current mean (compliance)
+  w-mean-gini   ; the running average (gini)
+  w-M2-gini ; the running sum of squares of differences from the current mean (gini)
+  w-mean-tax   ; the running average (tax)
+  w-M2-tax ; the running sum of squares of differences from the current mean (tax)
+]
+
+breed [citizens citizen]
+
+citizens-own [
+  ;; Fixed attributes
+  income ;; Float - Income sampled at the start of simulation
+  preferences ;; String - Utilitarian, capability
+  knowledge   ;; Boolean - true if citizen has knowledge about tax system
+  base-compliance-probability  ;; Float - inherent compliance based on knowledge and preferences
+  final-compliance-probability
+  disadvantaged  ;; Boolean - true if citizens is disadvantaged, relevant for capability world
+  disadvantage-severity  ;; Hard, middle, soft
+
+  ;; Variable attributes
+  disposable ;; Float - post-tax disposable amount - subject to gini and quartile calculation
+  tax ;; Float - tax payed
+  compliant   ;; Boolean - true if citizens is compliant in current step
+  peer-influence-modifier ;; Float - Share of compliant or non-compliant neighbours affecting peer-influence
+]
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;Setup and Initialization Procedures;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+to setup-welford
+  set w-count 0
+  set w-mean-comp 0
+  set w-M2-comp 0
+  set w-mean-gini 0
+  set w-M2-gini 0
+  set w-mean-tax 0
+  set w-M2-tax 0
+end
+
+to setup
+  clear-all
+  setup-welford
+  set step-tax-collected 0
+  set redistributable-tax 0
+  set cumulative-tax-collected 0
+
+  ; Fixed parameters based on calibration and expert knowledge
+  set avg-degree 5 ;; 5 based on Dunbar et al.
+  set homophily-strength 2 ;; Medium strength of homophily
+  set log-mean ln 58500  ; Adjusted based on empirical data
+  set log-sd 0.7     ; Adjusted based on empirical data
+  set tax-rate 0.37 ; Based on OECD and Polish source data
+  set fraction-disadvantaged 31 ; Set based on empirical data - estimated fraction of retired and other disadvantaged population in Poland
+  set disadvantaged-tax-share-rate 46 ; Set based on empirical data - estimated redistribution based on ZUS data
+  set match-compliance-probability 80 ;; Increased compliance with matching preferences of citizen and world
+  set mismatch-compliance-probability 20 ;; Decreased compliance with not matching preferences of citizen and world
+  set random-compliance-probability 50 ;; Random compliance with no knowledge
+
+  ask patches [ set pcolor white ] ;; White background
+  set-default-shape citizens "circle" ;; Nodes as circles
+  create-citizens num-citizens [
+    setup-attributes
+  ]
+
+  setup-network ;; Network structure - homophily based on income
+  influence-high-degrees perc-top-degree-knowledgeable
+
+  ; Statistics and reporting
+  earn-income
+  calculate-gini
+  calculate-quartiles
+  add-running-variance
+  reset-ticks
+end
+
+
+to setup-attributes
+  setxy (random-xcor) (random-ycor)
+  ;; Set income using a log-normal distribution
+  set income exp random-normal log-mean log-sd
+  set size sqrt income / 130 ;; Should looks nice in picked world size
+  ;; Randomly assign knowledge
+  set knowledge random-float 1.0 < (knowledge-level / 100)
+
+  ;; Assign preferences based on the utilitarian-fraction slider
+  ifelse random 100 < utilitarian-fraction [
+    set preferences "utilitarian"
+  ] [
+    set preferences "capability"
+  ]
+  let world-preference-str ifelse-value world-preference ["utilitarian"] ["capability"]
+  ;; Initialize base compliance probability
+  ifelse knowledge [
+    ifelse preferences = world-preference-str [
+      set base-compliance-probability match-compliance-probability / 100
+    ][
+      set base-compliance-probability mismatch-compliance-probability / 100
+    ]
+  ][
+    set base-compliance-probability random-compliance-probability / 100
+  ]
+  ;; Assign disadvantaged status
+  set disadvantaged random-float 1.0 < (fraction-disadvantaged / 100)
+  if disadvantaged [
+    set disadvantage-severity one-of ["hard" "middle" "soft"]
+  ]
+
+  ;; Initialize compliant status randomly
+  set compliant random-float 1.0 < 0.5  ;; 50% chance to start as compliant
+  ifelse compliant [set color green] [set color red]
+  set tax 0
+  set disposable 0
+end
+
+to layout-horizontal-income
+  ; Find the lowest and highest incomes in the population
+  let min-inc ln min [income] of citizens
+  let max-inc ln max [income] of citizens
+  let inc-range (max-inc - min-inc)
+
+  ask citizens [
+    let new-x min-pxcor + (((ln income - min-inc) / inc-range) * world-width * 0.9)
+    setxy new-x ycor
+  ]
+end
+
+to-report relative-income-similarity [ income-a income-b ]
+  ; Calculate and report the similarity score (from 0 to 1)
+  let difference abs (income-a - income-b)
+  let total (income-a + income-b)
+  let base-similarity (1 - (difference / total))
+  report base-similarity ^ homophily-strength
+end
+
+to setup-network
+  layout-horizontal-income
+  let n-edges avg-degree * num-citizens / 2
+  let created 0
+  while [created < n-edges] [
+    ask one-of citizens [
+      let other-citizen-without-link one-of other citizens with [not link-neighbor? myself]
+      let other-income [income] of other-citizen-without-link
+      let score relative-income-similarity income other-income
+      if random-float 1.0 < score
+      [
+        create-link-with other-citizen-without-link
+        set created created + 1
+      ]
+    ]
+
+  ]
+  repeat 10
+  [
+    layout-spring citizens links 0.2 (world-width / (sqrt num-citizens)) (world-width / num-citizens) * 4
+  ]
+  ask citizens [
+    if abs xcor > max-pxcor [ set xcor max-pxcor * 0.95]
+    if abs ycor > max-pycor [ set ycor max-pycor * 0.95]
+  ]
+end
+
+to influence-high-degrees [top-perc-influenced]
+  if top-perc-influenced > 0 [
+    let sorted-degree sort [count link-neighbors] of citizens
+    let index round (100 - top-perc-influenced) * num-citizens / 100
+    let degree-threshold item index sorted-degree
+    ask citizens with [count link-neighbors >= degree-threshold] [
+      set knowledge true
+    ]
+  ]
+end
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;Statistics calculation;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to-report quartiles [ xs ]
+  let med median xs
+  let upper filter [ x -> x > med ] xs
+  let lower filter [ x -> x < med ] xs
+  set upper ifelse-value empty? upper [ med ] [ median upper ]
+  set lower ifelse-value empty? lower [ med ] [ median lower ]
+  report (list min xs lower med upper max xs)
+end
+
+
+;Quartiles calculation
+to calculate-quartiles
+  let list-disposable [disposable] of citizens
+  let qs quartiles list-disposable
+  set q0 item 0 qs
+  set q1 item 1 qs
+  set q2 item 2 qs
+  set q3 item 3 qs
+  set q4 item 4 qs
+end
+
+to calculate-gini
+  let sorted-disposable sort [disposable] of citizens
+  let n length sorted-disposable
+  if n <= 1 [ set gini 0 ]
+
+  let total sum sorted-disposable
+  if total = 0 [ set gini 0 ]
+
+  let indexes (range 1 (n + 1))
+  let sum-index-disposable sum (map [ [i y] -> i * y ] indexes sorted-disposable)
+  let s1 (2 * sum-index-disposable)
+  let s2 (n * total)
+
+  set gini (s1 / s2) - ((n + 1) / n)
+end
+
+to add-running-variance
+  set w-count w-count + 1
+  let delta 0
+  let delta2 0
+  ;; Compliance
+  set delta (compliance-rate - w-mean-comp)
+  set w-mean-comp w-mean-comp + (delta / w-count)
+  set delta2 (compliance-rate - w-mean-comp)
+  set w-M2-comp w-M2-comp + (delta * delta2)
+  ;; Gini
+  set delta (gini - w-mean-gini)
+  set w-mean-gini w-mean-gini + (delta / w-count)
+  set delta2 (gini - w-mean-gini)
+  set w-M2-gini w-M2-gini + (delta * delta2)
+  ;; Tax
+  set delta (step-tax-collected - w-mean-tax)
+  set w-mean-tax w-mean-tax + (delta / w-count)
+  set delta2 (step-tax-collected - w-mean-tax)
+  set w-M2-tax w-M2-tax + (delta * delta2)
+end
+
+to-report get-sample-variance-comp
+  if w-count < 2 [ report 0 ]
+  report w-M2-comp / (w-count - 1)
+end
+
+to-report get-sample-variance-gini
+  if w-count < 2 [ report 0 ]
+  report w-M2-gini / (w-count - 1)
+end
+
+to-report get-sample-variance-tax
+  if w-count < 2 [ report 0 ]
+  report w-M2-tax / (w-count - 1)
+end
+
+;;;;;;;;;;;;;;;;;;;;;;
+;;Simulation's logic;;
+;;;;;;;;;;;;;;;;;;;;;;
+
+to go
+  if ticks >= num-rounds [
+    stop
+  ]
+  ; Main logic
+  earn-income
+  calculate-compliance
+  collect-taxes
+  redistribute-tax
+  calculate-gini
+  calculate-quartiles
+  add-running-variance
+  tick
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;Tax Calculation and Compliance;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to calculate-compliance
+  ask citizens [
+    let compliant-neighbors count link-neighbors with [compliant]
+    let noncompliant-neighbors count link-neighbors with [not compliant]
+    let total-neighbors count link-neighbors
+
+    ;; Calculate the fraction of compliant and noncompliant neighbors
+    let compliant-fraction ifelse-value (total-neighbors > 0) [compliant-neighbors / total-neighbors] [0]
+    let noncompliant-fraction ifelse-value (total-neighbors > 0) [noncompliant-neighbors / total-neighbors] [0]
+
+    ;; Apply peer influence
+    let peer-influence-compliance 0
+    let peer-influence-noncompliance 0
+    set peer-influence-modifier 0
+    if compliant-neighbors > noncompliant-neighbors [
+      set peer-influence-modifier compliant-fraction
+      set peer-influence-compliance peer-influence / 100 * peer-influence-modifier
+    ]
+    if noncompliant-neighbors > compliant-neighbors [
+      set peer-influence-modifier noncompliant-fraction
+      set peer-influence-noncompliance peer-influence / 100 * peer-influence-modifier
+    ]
+
+    set final-compliance-probability base-compliance-probability + peer-influence-compliance - peer-influence-noncompliance
+    set final-compliance-probability max list 0 (min list 1 final-compliance-probability)
+
+    set compliant random-float 1.0 < final-compliance-probability
+    ifelse compliant [set color green] [set color red]
+  ]
+end
+
+
+to-report compliance-rate
+  if num-citizens = 0 [report 0]
+  report count citizens with [compliant] / num-citizens
+end
+
+to earn-income
+  ask citizens [
+   set disposable income
+  ]
+end
+
+to collect-taxes
+  set step-tax-collected 0
+  ask citizens [
+    ifelse compliant [
+      set tax disposable * tax-rate
+      set disposable disposable - tax
+      set redistributable-tax redistributable-tax + tax
+      set step-tax-collected step-tax-collected + tax
+    ]
+    [
+      set tax 0
+    ]
+  ]
+end
+
+;Income Redistribution
+to redistribute-tax
+  ;; Redistribute the collected taxes based on world preference
+  ifelse world-preference [
+    redistribute-utilitarian
+  ] [
+    redistribute-capability
+  ]
+  set cumulative-tax-collected cumulative-tax-collected + (step-tax-collected / 1000000)
+end
+
+
+to redistribute-capability
+  let total-weights sum (map [severity ->
+    ifelse-value (severity = "hard") [3]
+    [ifelse-value (severity = "middle") [2]
+    [ifelse-value (severity = "soft") [1]
+        [0]]]] [disadvantage-severity] of citizens)
+
+  let redistribution-pool redistributable-tax
+  let base-share redistribution-pool * (1 - disadvantaged-tax-share-rate / 100) / count citizens
+  let additional-tax-collected redistribution-pool * disadvantaged-tax-share-rate / 100  ;; disadvantaged-tax-share-rate of the collected tax goes into weighted distribution
+  set redistributable-tax 0
+
+  ask citizens [
+      let severity-weight ifelse-value (disadvantage-severity = "hard") [3]
+                           [ifelse-value (disadvantage-severity = "middle") [2]
+                              [ifelse-value (disadvantage-severity = "soft") [1]
+                              [0]]]
+      let disadvantaged-share (severity-weight / total-weights) * additional-tax-collected
+      let my-subsidy-tax tax-rate * (base-share + disadvantaged-share)
+      set step-tax-collected step-tax-collected + my-subsidy-tax
+      set redistributable-tax redistributable-tax + my-subsidy-tax
+      set disposable disposable + (1 - tax-rate) * (base-share + disadvantaged-share)
+  ]
+end
+
+to redistribute-utilitarian
+  let total-disposable sum [disposable] of citizens
+  let average-disposable total-disposable / num-citizens
+  let poorest citizens with [disposable < average-disposable]
+  let total-diff sum [average-disposable - disposable] of poorest
+  let redistribution-pool redistributable-tax
+  set redistributable-tax 0
+
+  ask poorest [
+    let my-diff (average-disposable - disposable)
+    let my-tax-share (my-diff / total-diff)
+
+    let my-subsidy (1 - tax-rate) * (redistribution-pool * my-tax-share)
+    set disposable disposable + my-subsidy
+    let my-subsidy-tax tax-rate * redistribution-pool * my-tax-share
+    set step-tax-collected step-tax-collected + my-subsidy-tax
+    set redistributable-tax redistributable-tax + my-subsidy-tax
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;Data Collection and Export;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+to export-agent-data
+  let filename (word "/Users/lukasz/Desktop/tax_compliance_results/agent-data-run-" behaviorspace-run-number ".csv")
+  file-open filename
+  file-print "run,tick,who,income,disposable,compliant,knowledge,disadvantaged,base-compliance-probability,final-compliance-probability,peer-influence-modifier,degree"
+  ask citizens [
+    ; word combines everything into one comma-separated string
+    file-print (word behaviorspace-run-number "," ticks "," who "," income "," disposable "," compliant "," knowledge "," disadvantaged "," base-compliance-probability "," final-compliance-probability "," peer-influence-modifier "," count link-neighbors)
+  ]
+  file-close
+end
+
+to export-run-data
+  let filename (word "/Users/lukasz/Desktop/tax_compliance_results/data-run-" behaviorspace-run-number ".csv")
+  file-open filename
+  file-print "run-number,tick,world-preference,utilitarian-fraction,peer-influence,num-citizens,knowledge-level,perc-top-degree,gini,gini-mean,gini-var,total-tax,step-tax,step-tax-mean,step-tax-var,compliance-rate,compliance-rate-mean,compliance-rate-var"
+  file-print (word behaviorspace-run-number "," ticks "," world-preference "," utilitarian-fraction "," peer-influence "," num-citizens "," knowledge-level "," perc-top-degree-knowledgeable "," gini "," w-mean-gini "," get-sample-variance-gini "," cumulative-tax-collected "," step-tax-collected "," w-mean-tax "," get-sample-variance-tax "," compliance-rate "," w-mean-comp "," get-sample-variance-comp )
+  file-close
+end]]></code>
+  <widgets>
+    <view x="30" wrappingAllowedX="false" y="10" frameRate="30.0" minPycor="-25" height="304" showTickCounter="true" patchSize="5.9" fontSize="10" wrappingAllowedY="false" width="304" tickCounterLabel="ticks" maxPycor="25" updateMode="0" maxPxcor="25" minPxcor="-25"></view>
+    <slider x="580" step="10" y="100" max="100" width="231" display="utilitarian-fraction" height="50" min="0" direction="Horizontal" default="50.0" variable="utilitarian-fraction"></slider>
+    <slider x="580" step="10" y="164" max="100" width="231" display="knowledge-level" height="50" min="0" direction="Horizontal" default="50.0" variable="knowledge-level"></slider>
+    <monitor x="1055" precision="2" y="95" height="60" fontSize="11" width="100" display="Current GINI">gini</monitor>
+    <monitor x="1160" precision="2" y="95" height="60" fontSize="11" width="100" display="Compliance %">compliance-rate</monitor>
+    <slider x="580" step="1" y="228" max="100" width="231" display="peer-influence" height="50" min="0" direction="Horizontal" default="50.0" variable="peer-influence"></slider>
+    <monitor x="825" precision="0" y="135" height="60" fontSize="11" width="100" display="Q1">q1</monitor>
+    <monitor x="825" precision="0" y="200" height="60" fontSize="11" width="100" display="Q2">q2</monitor>
+    <monitor x="825" precision="0" y="265" height="60" fontSize="11" width="100" display="Q3">q3</monitor>
+    <monitor x="825" precision="0" y="330" height="60" fontSize="11" width="100" display="Max">q4</monitor>
+    <monitor x="1265" precision="0" y="95" height="60" fontSize="11" width="100" display="Tax">sum [tax] of citizens</monitor>
+    <monitor x="930" precision="2" y="160" height="60" fontSize="11" width="100" display="Q1-Q2 Comp %"><![CDATA[mean [ifelse-value compliant [1] [0]] of citizens with [disposable > q1 and disposable < q2]]]></monitor>
+    <monitor x="930" precision="2" y="225" height="60" fontSize="11" width="100" display="Q2-Q3 Comp %"><![CDATA[mean [ifelse-value compliant [1] [0]] of citizens with [disposable > q2 and disposable < q3]]]></monitor>
+    <monitor x="930" precision="2" y="290" height="60" fontSize="11" width="100" display="Q3-Max Comp %"><![CDATA[mean [ifelse-value compliant [1] [0]] of citizens with [disposable > q3 and disposable < q4]]]></monitor>
+    <monitor x="825" precision="0" y="70" height="60" fontSize="11" width="100" display="Min">q0</monitor>
+    <monitor x="930" precision="2" y="95" height="60" fontSize="11" width="100" display="Min-Q1 Comp %"><![CDATA[mean [ifelse-value compliant [1] [0]] of citizens with [disposable < q1]]]></monitor>
+    <monitor x="1055" precision="3" y="160" height="60" fontSize="11" width="100" display="Mean Gini">w-mean-gini</monitor>
+    <monitor x="1055" precision="3" y="225" height="60" fontSize="11" width="100" display="CV Gini">sqrt get-sample-variance-gini / w-mean-gini</monitor>
+    <monitor x="1160" precision="3" y="160" height="60" fontSize="11" width="100" display="Mean compliance">w-mean-comp</monitor>
+    <monitor x="1160" precision="3" y="225" height="60" fontSize="11" width="100" display="CV compliance">get-sample-variance-comp / w-mean-comp</monitor>
+    <monitor x="1265" precision="0" y="160" height="60" fontSize="11" width="100" display="Mean Tax">w-mean-tax</monitor>
+    <monitor x="1265" precision="3" y="225" height="60" fontSize="11" width="100" display="CV Tax">sqrt get-sample-variance-tax / w-mean-tax</monitor>
+    <note x="360" y="70" backgroundDark="0" fontSize="11" width="195" markdown="false" height="28" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">ON: Utilitarian | OFF: Capability</note>
+    <slider x="350" step="1" y="230" max="100" width="215" display="num-citizens" height="50" min="0" direction="Horizontal" default="100.0" variable="num-citizens"></slider>
+    <switch x="350" y="100" height="50" on="false" variable="world-preference" width="215" display="world-preference"></switch>
+    <slider x="350" step="10" y="165" max="1000" width="215" display="num-rounds" height="50" min="0" direction="Horizontal" default="150.0" variable="num-rounds"></slider>
+    <monitor x="1115" precision="6" y="290" height="60" fontSize="11" width="215" display="Cumulative Taxes (millions)">cumulative-tax-collected</monitor>
+    <plot x="30" autoPlotX="true" yMax="100.0" autoPlotY="true" yAxis="Citizens" y="395" xMin="0.0" height="202" legend="false" xMax="100.0" yMin="0.0" width="345" xAxis="Ticks" display="Compliant Taxpayers">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="pen-0" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot count citizens with [compliant = true]</update>
+      </pen>
+    </plot>
+    <plot x="380" autoPlotX="true" yMax="100.0" autoPlotY="true" yAxis="Taxes" y="395" xMin="0.0" height="202" legend="false" xMax="100.0" yMin="0.0" width="345" xAxis="Ticks" display="Taxes Collected">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="default" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot step-tax-collected</update>
+      </pen>
+    </plot>
+    <plot x="380" autoPlotX="true" yMax="100.0" autoPlotY="true" yAxis="Taxes" y="600" xMin="0.0" height="254" legend="true" xMax="100.0" yMin="0.0" width="345" display="Average Tax by Disposable Income Quartile">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="1st Quartile" color="-2674135" legend="true">
+        <setup></setup>
+        <update><![CDATA[plotxy ticks mean [tax] of citizens with [disposable <= q1]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="2nd Quartile" color="-955883" legend="true">
+        <setup></setup>
+        <update><![CDATA[plotxy ticks mean [tax] of citizens with [disposable > q1 and disposable < q2]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="3rd Quartile" color="-1184463" legend="true">
+        <setup></setup>
+        <update><![CDATA[plotxy ticks mean [tax] of citizens with [disposable > q2 and disposable < q3]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="4th Quartile" color="-13345367" legend="true">
+        <setup></setup>
+        <update><![CDATA[plotxy ticks mean [tax] of citizens with [disposable > q3]]]></update>
+      </pen>
+    </plot>
+    <plot x="30" autoPlotX="false" yMax="1.0" autoPlotY="false" yAxis="Gini index" y="600" xMin="0.0" height="210" legend="false" xMax="10.0" yMin="0.0" width="345" xAxis="Ticks" display="Gini Index">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="default" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot gini</update>
+      </pen>
+    </plot>
+    <plot x="730" autoPlotX="true" yMax="10.0" autoPlotY="true" y="395" xMin="0.0" height="202" legend="false" xMax="20.0" yMin="0.0" width="275" display="Degree distribution">
+      <setup>set-histogram-num-bars 12</setup>
+      <update></update>
+      <pen interval="1.0" mode="1" display="default" color="-16777216" legend="true">
+        <setup></setup>
+        <update>histogram [count link-neighbors] of turtles</update>
+      </pen>
+    </plot>
+    <plot x="730" autoPlotX="true" yMax="3.0" autoPlotY="true" y="600" xMin="0.0" height="210" legend="false" xMax="300000.0" yMin="0.0" width="275" display="Income distribution">
+      <setup>set-histogram-num-bars 12</setup>
+      <update></update>
+      <pen interval="1.0" mode="1" display="default" color="-16777216" legend="true">
+        <setup>histogram [income] of citizens</setup>
+        <update>histogram [round income] of citizens</update>
+      </pen>
+    </plot>
+    <plot x="1010" autoPlotX="true" yMax="10.0" autoPlotY="true" y="480" xMin="0.0" height="210" legend="false" xMax="300000.0" yMin="0.0" width="280" display="Disposable income distribution">
+      <setup>set-histogram-num-bars 12</setup>
+      <update></update>
+      <pen interval="1.0" mode="1" display="default" color="-16777216" legend="true">
+        <setup></setup>
+        <update>histogram [disposable] of citizens</update>
+      </pen>
+    </plot>
+    <button x="475" y="290" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="91" display="Go">go</button>
+    <button x="350" y="290" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="91" display="Setup">setup</button>
+    <slider x="580" step="1" y="291" max="100" width="231" display="perc-top-degree-knowledgeable" height="50" min="0" direction="Horizontal" default="0.0" variable="perc-top-degree-knowledgeable"></slider>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="Experiment1" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>random-seed (behaviorspace-run-number * 100)
+setup</setup>
+      <go>go</go>
+      <postRun>export-agent-data
+export-run-data</postRun>
+      <constants>
+        <enumeratedValueSet variable="world-preference">
+          <value value="true"></value>
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <steppedValueSet variable="utilitarian-fraction" first="0" step="20" last="100"></steppedValueSet>
+        <steppedValueSet variable="peer-influence" first="0" step="20" last="100"></steppedValueSet>
+        <enumeratedValueSet variable="num-citizens">
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <steppedValueSet variable="knowledge-level" first="0" step="20" last="100"></steppedValueSet>
+        <enumeratedValueSet variable="num-rounds">
+          <value value="150"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="perc-top-degree-knowledgeable">
+          <value value="0"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="Experiment2-degree" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>random-seed (behaviorspace-run-number * 100)
+setup</setup>
+      <go>go</go>
+      <postRun>export-agent-data
+export-run-data</postRun>
+      <constants>
+        <enumeratedValueSet variable="world-preference">
+          <value value="true"></value>
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <steppedValueSet variable="utilitarian-fraction" first="0" step="20" last="100"></steppedValueSet>
+        <steppedValueSet variable="peer-influence" first="0" step="20" last="100"></steppedValueSet>
+        <enumeratedValueSet variable="num-citizens">
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="knowledge-level">
+          <value value="0"></value>
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-rounds">
+          <value value="150"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="perc-top-degree-knowledgeable">
+          <value value="0"></value>
+          <value value="10"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
